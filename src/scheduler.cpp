@@ -120,6 +120,7 @@ class Scheduler::Impl {
   std::size_t active_conflicts(const Record& r) const;
   void index_active_grant(const CollectiveGrant& g);
   void deindex_active_grant(const CollectiveGrant& g);
+  void end_grant(GrantState& gs);
   CollectiveGrant create_grant(Record& r, const EvidenceSnapshot& snap, const ScheduleDecision& dec);
   void promote_to_granted(Record& r) const;
 };
@@ -454,6 +455,17 @@ void Scheduler::Impl::deindex_active_grant(const CollectiveGrant& g) {
     it->second.erase(g.id);
     if (it->second.empty()) active_by_participant.erase(it);
   }
+}
+
+// Ends a grant exactly once. A grant counts as active (and occupies its
+// participants) from the moment it is dispatched until it ends, so only such a
+// grant leaves the active-grant count.
+void Scheduler::Impl::end_grant(GrantState& gs) {
+  if (gs.terminal) return;
+  deindex_active_grant(gs.grant);
+  if (gs.active && active_grants > 0) --active_grants;
+  gs.active = false;
+  gs.terminal = true;
 }
 
 void Scheduler::Impl::promote_to_granted(Record& r) const {
@@ -796,7 +808,8 @@ void Scheduler::supersede(CollectiveRequest req) {
   if (old.lifecycle.state() != LifecycleState::COMPLETED && old.lifecycle.state() != LifecycleState::CANCELLED) {
     try { old.lifecycle.transition(LifecycleState::SUPERSEDED); } catch (const scheduler_error&) { old.lifecycle = Lifecycle(LifecycleState::SUPERSEDED); }
   }
-  if (old_grant) { auto gs = impl_->grants.find(old_grant->id); if (gs != impl_->grants.end()) { impl_->deindex_active_grant(gs->second.grant); gs->second.terminal = true; gs->second.active = false; } if (impl_->active_grants > 0) --impl_->active_grants; }
+  std::optional<CollectiveGrant> revoke;
+  if (old_grant) { auto gs = impl_->grants.find(old_grant->id); if (gs != impl_->grants.end() && !gs->second.terminal) { revoke = gs->second.grant; impl_->end_grant(gs->second); } }
   // Replace request in-place with new generation.
   Record nrec;
   nrec.request = std::move(req);
@@ -805,6 +818,9 @@ void Scheduler::supersede(CollectiveRequest req) {
   nrec.fairness = old.fairness;
   for (auto pid : nrec.request.participants) impl_->participant_requests[pid].insert(nrec.request.id);
   impl_->records[nrec.request.id] = std::move(nrec);
+  auto fabric = impl_->fabric;
+  l.unlock();
+  if (revoke && fabric) fabric->revoke(*revoke);
 }
 
 void Scheduler::cancel(CollectiveRequestId id) {
@@ -859,9 +875,20 @@ bool Scheduler::handoff(const CollectiveGrant& g) {
     std::unique_lock l(impl_->mu);
     if (impl_->revalidate_grant(g) != GrantAdjudication::VALID) return false;
     auto rit = impl_->records.find(g.request); if (rit == impl_->records.end()) return false;
-    try { rit->second.lifecycle.transition(LifecycleState::DISPATCHING); } catch (const scheduler_error&) { return false; }
     auto gs = impl_->grants.find(g.id);
-    if (gs != impl_->grants.end()) { gs->second.handed_off = true; gs->second.grant = g; }
+    // Only the request's current, live grant is dispatched. Grants issued by
+    // separate schedule() calls are not checked against each other, so the
+    // dispatch itself must not run alongside a conflicting dispatched or active
+    // grant, nor exceed the active-grant bound.
+    if (gs == impl_->grants.end() || gs->second.terminal) return false;
+    if (!rit->second.current_grant || rit->second.current_grant->id.value != g.id.value) return false;
+    if (!Lifecycle::can_transition(rit->second.lifecycle.state(), LifecycleState::DISPATCHING)) return false;
+    if (impl_->active_conflicts(rit->second) > 0) return false;
+    if (impl_->active_grants >= impl_->policy.bounds.max_active_grants) return false;
+    try { rit->second.lifecycle.transition(LifecycleState::DISPATCHING); } catch (const scheduler_error&) { return false; }
+    gs->second.handed_off = true; gs->second.grant = g;
+    // A dispatching grant occupies its participants and its slot until it ends.
+    gs->second.active = true; ++impl_->active_grants; impl_->index_active_grant(gs->second.grant);
     fabric = impl_->fabric;
     gc = g;
   }
@@ -871,18 +898,20 @@ bool Scheduler::handoff(const CollectiveGrant& g) {
   {
     std::unique_lock l(impl_->mu);
     auto rit = impl_->records.find(gc->request);
-    if (rit != impl_->records.end()) {
-      auto& rec = rit->second;
-      if (rec.lifecycle.state() == LifecycleState::DISPATCHING && accepted) {
-        try { rec.lifecycle.transition(LifecycleState::ACTIVE); } catch (const scheduler_error&) {}
-      }
-      auto gs = impl_->grants.find(gc->id);
-      if (gs != impl_->grants.end()) {
-        bool isActive = (rec.lifecycle.state() == LifecycleState::ACTIVE);
-        gs->second.active = isActive;
-        if (isActive) { ++impl_->active_grants; impl_->index_active_grant(gs->second.grant); } else { revoke = true; }
-      } else { revoke = true; }
-    } else { revoke = true; }
+    auto gs = impl_->grants.find(gc->id);
+    // While the fabric decided, the grant may have been completed, cancelled,
+    // superseded or fenced (and the request granted afresh); only this dispatch,
+    // still live, becomes ACTIVE.
+    const bool live = rit != impl_->records.end() && gs != impl_->grants.end() && !gs->second.terminal &&
+                      rit->second.current_grant && rit->second.current_grant->id.value == gc->id.value &&
+                      rit->second.lifecycle.state() == LifecycleState::DISPATCHING;
+    if (live && accepted) {
+      try { rit->second.lifecycle.transition(LifecycleState::ACTIVE); } catch (const scheduler_error&) {}
+    } else {
+      revoke = true;
+      // The fabric refused it: end the grant so it gives up its slot and participants.
+      if (live) impl_->end_grant(gs->second);
+    }
   }
   if (revoke && fabric) fabric->revoke(*gc);
   return accepted && !revoke;
@@ -927,6 +956,7 @@ bool Scheduler::complete(const CollectiveGrant& g, const WorkerBootId& wb, const
 
 void Scheduler::fenceWorkerBoot(WorkerId worker, WorkerBootId boot) {
   std::unique_lock l(impl_->mu);
+  std::vector<CollectiveGrant> revoke;
   for (auto& [pid, p] : impl_->participants) {
     (void)pid;
     if (p.worker.value == worker.value && p.worker_boot.value == boot.value) {
@@ -946,10 +976,14 @@ void Scheduler::fenceWorkerBoot(WorkerId worker, WorkerBootId boot) {
             default: break;
           }
         } catch (const scheduler_error&) {}
-        if (rec.current_grant) { auto gs = impl_->grants.find(rec.current_grant->id); if (gs != impl_->grants.end()) { impl_->deindex_active_grant(gs->second.grant); gs->second.terminal = true; gs->second.active = false; } }
+        // The fenced grant must not proceed: end it (releasing its slot) and revoke it after unlock.
+        if (rec.current_grant) { auto gs = impl_->grants.find(rec.current_grant->id); if (gs != impl_->grants.end() && !gs->second.terminal) { revoke.push_back(gs->second.grant); impl_->end_grant(gs->second); } }
       }
     }
   }
+  auto fabric = impl_->fabric;
+  l.unlock();
+  if (fabric) for (const auto& g : revoke) fabric->revoke(g);
 }
 
 Scheduler::Info Scheduler::info() const {

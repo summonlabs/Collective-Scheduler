@@ -98,7 +98,44 @@ class Client {
     }
     return out;
   }
+  // Reads frames until the QUERY_SCHEDULE summary (a HELLO with a payload)
+  // arrives; the summary is the last frame returned.
+  std::vector<Msg> recv_until_summary(int max_wait_ms = 3000) {
+    std::vector<std::uint8_t> buf;
+    std::vector<Msg> out;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(max_wait_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+#ifdef _WIN32
+      fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds); timeval tv{0, 50000};
+      int sel = ::select(fd + 1, &fds, nullptr, nullptr, &tv);
+      if (sel > 0) {
+        char tmp[8192]; int n = ::recv(fd, tmp, sizeof(tmp), 0);
+        if (n <= 0) break;
+        buf.insert(buf.end(), tmp, tmp + n);
+        std::vector<Msg> ms;
+        if (!decode_frames(buf, ms)) break;
+        for (auto& m : ms) {
+          const bool summary = m.type == MsgType::HELLO && !m.payload.empty();
+          out.push_back(std::move(m));
+          if (summary) return out;
+        }
+      }
+#endif
+    }
+    return out;
+  }
 };
+
+// Stale-rejection count from a QUERY_SCHEDULE summary (selected, issued, stale).
+bool summary_stale(const std::vector<Msg>& msgs, std::uint64_t& stale) {
+  for (const auto& m : msgs) {
+    if (m.type != MsgType::HELLO || m.payload.empty()) continue;
+    PersistenceReader r(m.payload.data(), m.payload.size(), m.payload.size());
+    r.u64(); r.u64(); stale = r.u64();
+    return true;
+  }
+  return false;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -134,6 +171,35 @@ int main(int argc, char** argv) {
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   // Submit C1, C2, C3 (disjoint overlap allowed).
   auto submit = [&](std::uint64_t c, std::vector<ParticipantId> parts, std::uint64_t plan) { CollectiveRequest r; r.collective = CollectiveId(c); r.collective_gen = CollectiveGeneration(1); r.kind = CollectiveKind::ALL_REDUCE; r.participants = parts; r.participant_gens.assign(parts.size(), ParticipantGeneration(1)); r.plan_id = CommunicationPlanId(plan); r.plan_gen = CommunicationPlanGeneration(1); r.workload_gen = WorkloadGeneration(1); r.overlap = OverlapMode::OVERLAP_ALLOWED; r.priority.gen = PriorityGeneration(1); r.priority.authoritative = true; r.window.expected_duration_ns = 1000; PersistenceWriter w; serialize_request(w, r); send_frame(ctl.fd, MsgType::SUBMIT_COLLECTIVE, 10 + c, w.take()); };
+
+  // --- Completion of a coordinator-issued grant ---
+  // C7 runs on participants 7 and 8 of a worker this controller acts for (no
+  // worker process hosts them, so no other completion interleaves). The
+  // coordinator hands a grant off when it sends it, so the executing worker's
+  // authoritative completion is accepted, not counted as stale.
+  for (std::uint64_t pid : {7u, 8u}) {
+    Participant p; p.id = ParticipantId(pid); p.gen = ParticipantGeneration(1);
+    p.worker = WorkerId(7); p.worker_boot = WorkerBootId(71); p.source = SourceId(1); p.source_boot = SourceBootId(100);
+    p.device = DeviceId(pid); p.node = NodeId(1); p.nic = NicId(pid);
+    p.capability_gen = CapabilityGeneration(1); p.health_gen = HealthGeneration(1); p.topology_gen = TopologyGeneration(1);
+    p.ready = true; p.readiness_source = ProvenanceStatus::REAL; p.provenance = ProvenanceStatus::REAL;
+    PersistenceWriter w; serialize_participant(w, p); send_frame(ctl.fd, MsgType::PUBLISH_PARTICIPANT, 70 + pid, w.take());
+  }
+  { PersistenceWriter w; CommunicationPlan p; p.id = CommunicationPlanId(7); p.gen = CommunicationPlanGeneration(1); p.kind = CollectiveKind::ALL_REDUCE; p.topology_gen = TopologyGeneration(1); p.participants = {ParticipantId(7), ParticipantId(8)}; p.links = {LinkId(107)}; p.valid = true; p.provenance = ProvenanceStatus::SYNTHETIC; serialize_plan(w, p); send_frame(ctl.fd, MsgType::UPDATE_PLAN, 7, w.take()); }
+  submit(7, {ParticipantId(7), ParticipantId(8)}, 7);
+  send_frame(ctl.fd, MsgType::QUERY_SCHEDULE, 50, {});
+  auto msgs7 = ctl.recv_until_summary();
+  CollectiveGrant c7_grant; bool have_c7 = false;
+  for (auto& m : msgs7) if (m.type == MsgType::GRANT) { PersistenceReader r(m.payload.data(), m.payload.size(), m.payload.size()); auto g = deserialize_grant(r); if (g.collective.value == 7) { c7_grant = g; have_c7 = true; } }
+  std::uint64_t stale_before = 0, stale_after = 0;
+  bool sum_before = summary_stale(msgs7, stale_before);
+  report(have_c7 && sum_before, "C7 granted by the coordinator");
+  if (have_c7) { PersistenceWriter cw; serialize_grant(cw, c7_grant); cw.id(WorkerBootId(71).value); cw.id(SourceBootId(100).value); send_frame(ctl.fd, MsgType::COMPLETE, 52, cw.take()); }
+  send_frame(ctl.fd, MsgType::QUERY_SCHEDULE, 53, {});
+  auto msgs7b = ctl.recv_until_summary();
+  bool sum_after = summary_stale(msgs7b, stale_after);
+  report(have_c7 && sum_before && sum_after && stale_after == stale_before, "authoritative completion of a coordinator-issued grant was accepted");
+
   submit(1, {ParticipantId(1), ParticipantId(2)}, 1);
   submit(2, {ParticipantId(2), ParticipantId(3)}, 2);
   submit(3, {ParticipantId(3), ParticipantId(4)}, 3);

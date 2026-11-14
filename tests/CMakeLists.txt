@@ -8,7 +8,7 @@ endif()
 add_test(NAME cs_tests COMMAND cs_tests)
 
 # Per-area aliases registered as individual CTest tests that call the runner with a filter.
-set(CS_TEST_AREAS basic readiness conflict overlap determinism deadline fairness starvation priority_inversion lifecycle grant plan_invalidation congestion reservation dependency cancellation supersession persistence property concurrency adversarial multiprocess cuda worker_death coordinator_restart distribution hygiene)
+set(CS_TEST_AREAS regression basic readiness conflict overlap determinism deadline fairness starvation priority_inversion lifecycle grant plan_invalidation congestion reservation dependency cancellation supersession persistence property concurrency adversarial multiprocess cuda worker_death coordinator_restart distribution hygiene)
 foreach(area ${CS_TEST_AREAS})
   add_test(NAME cs_${area} COMMAND cs_tests ${area})
 endforeach()

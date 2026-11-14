@@ -175,6 +175,11 @@ void Coordinator::handle_message(int fd, Msg m) {
       for (auto gid : dec.grants) {
         auto g = impl_->scheduler.grantById(gid);
         if (!g) continue;
+        // Sending a grant to the workers is its execution handoff: revalidate it
+        // and make it ACTIVE, so it occupies its participants until the executing
+        // worker's completion is accepted. A grant that cannot be handed off is
+        // not sent.
+        if (!impl_->scheduler.handoff(*g)) continue;
         ++impl_->grants_issued;
         PersistenceWriter w; serialize_grant(w, *g); grant_payloads.push_back(w.take());
       }
